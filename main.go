@@ -61,6 +61,7 @@ func main() {
 	fmt.Println("DSN:", dsn)
 	selectedProjects := flag.Args()
 	fmt.Println("Selected projects: ", selectedProjects)
+	fmt.Println("Number of processors:", *nProc)
 
 	db, err := p4db.Connect(dsn)
 	defer db.Close()
@@ -89,6 +90,11 @@ func main() {
 	storageItemsChan = make(chan StorageItem)
 	readyJobs = make(chan PathsSetPerProject)
 
+	// Start in the direcottory where static files are situalted
+	if err = os.Chdir(filepath.Join(*dbRoot, "PROJECTS")); err != nil {
+		log.Fatal("Error:", err)
+	}
+
 	// Start processors goroutines, each reading StorageItem from the corresponding
 	// storageItemsChan
 	for i := 0; i < *nProc; i++ {
@@ -101,15 +107,16 @@ func main() {
 	// files in the storage file system and put them to the storageItemsChan channel
 	for i := 0; i < *nProc; i++ {
 		itemGeneratorsN.Add(1)
-		go storageItemsGenerator(0)
+		go storageItemsGenerator(i)
 	}
 
 	// Start fetching paths for each project to process, when project is ready
 	//
 
 	for _, projInfo := range projectsToProcess {
+		log.Println("--Starting project", projInfo.Name)
 		if paths, err := buildSetOfPaths4Project(db, projInfo); err == nil {
-			log.Println("sending job", paths.ProjectName, len(paths.Paths))
+			log.Println("--Sending job", paths.ProjectName, len(paths.Paths))
 			readyJobs <- paths
 		} else {
 			log.Fatal(err)
@@ -126,6 +133,10 @@ func main() {
 func storageItemsGenerator(i int) {
 	log.Println("**ItemsGenerator started", i)
 	for job := range readyJobs {
+		if _, err := os.Stat(job.ProjectPath); os.IsNotExist(err) {
+			log.Println("Warning:", err)
+			continue
+		}
 		walkProjectTree(job.ProjectName, job.ProjectPath, job.Paths)
 	}
 	log.Println("**ItemsGenerator finished", i)
@@ -192,7 +203,6 @@ func okToExpire(path string, info os.FileInfo) bool {
 	if filepath.Ext(nm) != ".dx" {
 		return false
 	}
-	log.Println(info.Size(), *szLimit)
 	if info.Size() < *szLimit {
 		return false
 	}
@@ -203,16 +213,15 @@ func okToExpire(path string, info os.FileInfo) bool {
 }
 
 func walkProjectTree(projName string, projDir string, activePaths PathsSet) (err error) {
-	if err = os.Chdir(filepath.Join(*dbRoot, "PROJECTS", projDir)); err != nil {
-		log.Println("Warning:", err)
-		return
-	}
-	err = filepath.Walk(".", func(fPath string, info os.FileInfo, err error) error {
-		fPath = path.Join(*dbRoot, "PROJECTS", projDir, fPath)
+	err = filepath.Walk(projDir, func(fPath string, info os.FileInfo, err error) error {
+		if info == nil {
+			log.Fatal("Error: nil file info for ", fPath)
+		}
+		fPath = path.Join(*dbRoot, "PROJECTS", fPath)
 		if !activePaths[fPath] {
 			storageItemsChan <- StorageItem{Path: fPath, Project: projName, Info: info}
 		} else {
-			log.Println("++Walk: found in active path", fPath)
+			// log.Println("++Walk: found in active path", fPath)
 		}
 		return nil
 	})
