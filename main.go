@@ -7,6 +7,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -20,10 +22,17 @@ var (
 	host       = flag.String("host", "127.0.0.1", "Host to connect to")
 	dbRoot     = flag.String("db_root", "/opt/PANGmisc/DB_ROOT", "Massive data root catalogue")
 	szLimit    = flag.Int64("sz_limit", 10000, "Consider only files larger than this parameter (bytes)")
+	nProc      = flag.Int("n_proc", 5, "Number of processors")
 )
 
 // PathsSet describes set of valid (sctual) paths relative to *dbRoot
 type PathsSet map[string]bool
+
+type StorageItem struct {
+	Path    string
+	Project string
+	Info    os.FileInfo
+}
 
 // PathsSetPerProject Describes set of valid paths related to project
 type PathsSetPerProject struct {
@@ -33,10 +42,12 @@ type PathsSetPerProject struct {
 	Paths       PathsSet
 }
 
-var (
-	generalDbPaths      PathsSet = make(PathsSet)
-	generalExpiredPaths PathsSet = make(PathsSet)
-)
+var storageItemsChan chan StorageItem
+var readyJobs chan PathsSetPerProject
+var itemGeneratorsN sync.WaitGroup
+var processorsN sync.WaitGroup
+
+var totalBytesProcessed int64
 
 func main() {
 	fmt.Println("Starting garbage collection...")
@@ -51,45 +62,86 @@ func main() {
 	selectedProjects := flag.Args()
 	fmt.Println("Selected projects: ", selectedProjects)
 
-	projSet, isEmpty := makeProjectsSet(selectedProjects)
-
 	db, err := p4db.Connect(dsn)
 	defer db.Close()
-
 	if err != nil {
 		log.Fatal("Unable to connect to DB", err)
 	}
-
-	// Stage 1: build general set of paths that are not mentionned in the DB
-	// by fetching list of active paths in project and then walking
-	// into the project directory and finding files the meet expiration criteria
-	// (size, extension, not belonging to META-INF)
 	projects, err := db.ProjectsNamePath()
 	if err != nil {
 		log.Fatal("Failed to get projects list from DB", err)
 	}
-	for _, projInfo := range projects {
-		_, isInArgs := projSet[projInfo.Name]
-		if isEmpty || isInArgs {
-			if paths, err := buildSetOfPaths4Project(db, projInfo); err == nil {
-				// generalDbPaths.updatePahSet(paths.Paths)
-				log.Println("Total: ", len(generalDbPaths), "Project: ", projInfo.Name, len(paths.Paths))
-				if expired, err := findExpired(projInfo.Path, paths.Paths); err == nil {
-					generalExpiredPaths.updatePahSet(expired)
-				} else {
-					log.Println("Warning: ", err, "during walking in ", projInfo.Path)
-				}
-			} else {
-				log.Fatal("Error while fetching files list: ", err)
+	// Filter projects so that only projects specified on the command line
+	// are left, or all the projects in the case when command line is empty
+	projectsToProcess := make([]p4db.NamePath, 0, len(projects))
+	if projSet, isEmpty := makeProjectsSet(selectedProjects); !isEmpty {
+		for _, p := range projects {
+			if _, ok := projSet[p.Name]; ok {
+				projectsToProcess = append(projectsToProcess, p)
 			}
 		}
+	} else {
+		projectsToProcess = projects
 	}
 
-	// Stage 2: Find all stray files that are found in DB_ROOT and
-	// do not belong to any projects
+	fmt.Println(projectsToProcess, len(projectsToProcess), cap(projectsToProcess))
 
-	// Stage 3: make the clean-up basing on the files list built in stage 1
-	makeCleanup()
+	storageItemsChan = make(chan StorageItem)
+	readyJobs = make(chan PathsSetPerProject)
+
+	// Start processors goroutines, each reading StorageItem from the corresponding
+	// storageItemsChan
+	for i := 0; i < *nProc; i++ {
+		processorsN.Add(1)
+		go finalProcessor(i)
+	}
+
+	// Start storage items generator goroutines, each will be waiting when a project ready to
+	// process appears in the readyJobs channel. It will collect
+	// files in the storage file system and put them to the storageItemsChan channel
+	for i := 0; i < *nProc; i++ {
+		itemGeneratorsN.Add(1)
+		go storageItemsGenerator(0)
+	}
+
+	// Start fetching paths for each project to process, when project is ready
+	//
+
+	for _, projInfo := range projectsToProcess {
+		if paths, err := buildSetOfPaths4Project(db, projInfo); err == nil {
+			log.Println("sending job", paths.ProjectName, len(paths.Paths))
+			readyJobs <- paths
+		} else {
+			log.Fatal(err)
+		}
+	}
+	close(readyJobs)
+
+	itemGeneratorsN.Wait()
+	close(storageItemsChan)
+	processorsN.Wait()
+	log.Println("Finished! Total Gbytes processed: ", float64(atomic.LoadInt64(&totalBytesProcessed))/1.e9)
+}
+
+func storageItemsGenerator(i int) {
+	log.Println("**ItemsGenerator started", i)
+	for job := range readyJobs {
+		walkProjectTree(job.ProjectName, job.ProjectPath, job.Paths)
+	}
+	log.Println("**ItemsGenerator finished", i)
+	itemGeneratorsN.Done()
+}
+
+func finalProcessor(i int) {
+	log.Println("**FinalProcessor started", i)
+	for item := range storageItemsChan {
+		if okToExpire(item.Path, item.Info) {
+			log.Println("==Processor", i, item)
+			atomic.AddInt64(&totalBytesProcessed, item.Info.Size())
+		}
+	}
+	log.Println("==FinalProcessor", i, "finished")
+	processorsN.Done()
 }
 
 func makeProjectsSet(projects []string) (res map[string]bool, isEmpty bool) {
@@ -130,6 +182,9 @@ func buildSetOfPaths4Project(db *p4db.P4db, projInfo p4db.NamePath) (res PathsSe
 }
 
 func okToExpire(path string, info os.FileInfo) bool {
+	if info.IsDir() {
+		return false
+	}
 	dir, nm := filepath.Split(path)
 	if dir == "META-INF" {
 		return false
@@ -141,59 +196,25 @@ func okToExpire(path string, info os.FileInfo) bool {
 	if info.Size() < *szLimit {
 		return false
 	}
-	log.Println(time.Since(info.ModTime()).Hours(), float64(*howOldDays*24))
 	if time.Since(info.ModTime()).Hours() < float64(*howOldDays*24) {
 		return false
 	}
 	return true
 }
 
-func findExpired(projDir string, activePaths PathsSet) (res PathsSet, err error) {
-	res = make(PathsSet)
-	resChan := make(chan string)
-	log.Println("Finding expired files in ", projDir)
-	walkFn := func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			log.Printf("unable to access a path %q: %v\n", path, err)
-			return filepath.SkipDir
-		}
-		if !info.IsDir() && okToExpire(path, info) {
-			path = filepath.Join(*dbRoot, "PROJECTS", projDir, path)
-			if _, ok := activePaths[path]; !ok {
-				resChan <- path
-			} else {
-				log.Println("Active: ", path)
-			}
+func walkProjectTree(projName string, projDir string, activePaths PathsSet) (err error) {
+	if err = os.Chdir(filepath.Join(*dbRoot, "PROJECTS", projDir)); err != nil {
+		log.Println("Warning:", err)
+		return
+	}
+	err = filepath.Walk(".", func(fPath string, info os.FileInfo, err error) error {
+		fPath = path.Join(*dbRoot, "PROJECTS", projDir, fPath)
+		if !activePaths[fPath] {
+			storageItemsChan <- StorageItem{Path: fPath, Project: projName, Info: info}
 		} else {
-			log.Println("Skip: ", path)
+			log.Println("++Walk: found in active path", fPath)
 		}
 		return nil
-	}
-	go func() {
-		defer close(resChan)
-		if err = os.Chdir(filepath.Join(*dbRoot, "PROJECTS", projDir)); err != nil {
-			return
-		}
-		err = filepath.Walk(".", walkFn)
-	}()
-	for p := range resChan {
-		fp := filepath.Join(*dbRoot, "PROJECTS", projDir, p)
-		res[fp] = true
-	}
+	})
 	return
-}
-
-func makeCleanup() (err error) {
-	fmt.Println(len(generalDbPaths))
-	for p := range generalExpiredPaths {
-		fmt.Println(p)
-	}
-	fmt.Println(len(generalExpiredPaths))
-	return
-}
-
-func (s *PathsSet) updatePahSet(otherSet PathsSet) {
-	for k, v := range otherSet {
-		(*s)[k] = v
-	}
 }
