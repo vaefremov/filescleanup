@@ -63,26 +63,9 @@ func main() {
 	fmt.Println("Selected projects: ", selectedProjects)
 	fmt.Println("Number of processors:", *nProc)
 
-	db, err := p4db.Connect(dsn)
-	defer db.Close()
+	projectsToProcess, err := makeProjectsListToProcess(dsn, selectedProjects)
 	if err != nil {
-		log.Fatal("Unable to connect to DB", err)
-	}
-	projects, err := db.ProjectsNamePath()
-	if err != nil {
-		log.Fatal("Failed to get projects list from DB", err)
-	}
-	// Filter projects so that only projects specified on the command line
-	// are left, or all the projects in the case when command line is empty
-	projectsToProcess := make([]p4db.NamePath, 0, len(projects))
-	if projSet, isEmpty := makeProjectsSet(selectedProjects); !isEmpty {
-		for _, p := range projects {
-			if _, ok := projSet[p.Name]; ok {
-				projectsToProcess = append(projectsToProcess, p)
-			}
-		}
-	} else {
-		projectsToProcess = projects
+		log.Fatal(err)
 	}
 
 	fmt.Println(projectsToProcess, len(projectsToProcess), cap(projectsToProcess))
@@ -113,16 +96,7 @@ func main() {
 	// Start fetching paths for each project to process, when project is ready
 	//
 
-	for _, projInfo := range projectsToProcess {
-		log.Println("--Starting project", projInfo.Name)
-		if paths, err := buildSetOfPaths4Project(db, projInfo); err == nil {
-			log.Println("--Sending job", paths.ProjectName, len(paths.Paths))
-			readyJobs <- paths
-		} else {
-			log.Fatal(err)
-		}
-	}
-	close(readyJobs)
+	databaseFeeder(dsn, projectsToProcess)
 
 	itemGeneratorsN.Wait()
 	close(storageItemsChan)
@@ -153,6 +127,48 @@ func finalProcessor(i int) {
 	}
 	log.Println("==FinalProcessor", i, "finished")
 	processorsN.Done()
+}
+
+var nFeeders sync.WaitGroup
+
+func databaseFeeder(dsn string, projectsToProcess []p4db.NamePath) (err error) {
+	for _, projInfo := range projectsToProcess {
+		nFeeders.Add(1)
+		go databaseFeederForProjectStarter(dsn, projInfo)
+	}
+	nFeeders.Wait()
+	close(readyJobs)
+	return nil
+}
+
+var sema = make(chan struct{}, 5)
+
+func databaseFeederForProjectStarter(dsn string, projInfo p4db.NamePath) {
+	sema <- struct{}{}
+	defer func() { <-sema }()
+	defer func() {
+		log.Println("**** Feeder ended")
+		nFeeders.Done()
+	}()
+	log.Println("**** Feeder started")
+	if err := databaseFeederForProject(dsn, projInfo); err != nil {
+		log.Fatal("failed to create feeder for project ", projInfo.Name, err)
+	}
+}
+
+func databaseFeederForProject(dsn string, projInfo p4db.NamePath) (err error) {
+	db, err := p4db.Connect(dsn)
+	defer db.Close()
+	if err != nil {
+	}
+	log.Println("--Starting project", projInfo.Name)
+	if paths, err := buildSetOfPaths4Project(db, projInfo); err == nil {
+		log.Println("--Sending job", paths.ProjectName, len(paths.Paths))
+		readyJobs <- paths
+	} else {
+		log.Fatal(err)
+	}
+	return nil
 }
 
 func makeProjectsSet(projects []string) (res map[string]bool, isEmpty bool) {
@@ -225,5 +241,30 @@ func walkProjectTree(projName string, projDir string, activePaths PathsSet) (err
 		}
 		return nil
 	})
+	return
+}
+
+func makeProjectsListToProcess(dsn string, cliProjects []string) (projectsToProcess []p4db.NamePath, err error) {
+	db, err := p4db.Connect(dsn)
+	defer db.Close()
+	if err != nil {
+		log.Fatal("Unable to connect to DB", err)
+	}
+	projects, err := db.ProjectsNamePath()
+	if err != nil {
+		log.Fatal("Failed to get projects list from DB", err)
+	}
+	// Filter projects so that only projects specified on the command line
+	// are left, or all the projects in the case when command line is empty
+	projectsToProcess = make([]p4db.NamePath, 0, len(projects))
+	if projSet, isEmpty := makeProjectsSet(cliProjects); !isEmpty {
+		for _, p := range projects {
+			if _, ok := projSet[p.Name]; ok {
+				projectsToProcess = append(projectsToProcess, p)
+			}
+		}
+	} else {
+		projectsToProcess = projects
+	}
 	return
 }
