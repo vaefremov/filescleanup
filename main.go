@@ -157,8 +157,7 @@ func databaseFeederForProjectStarter(dsn string, projInfo p4db.NamePath) {
 }
 
 func databaseFeederForProject(dsn string, projInfo p4db.NamePath) (err error) {
-	db, err := p4db.Connect(dsn)
-	defer db.Close()
+	db, err := p4db.New(dsn)
 	if err != nil {
 	}
 	log.Println("--Starting project", projInfo.Name)
@@ -245,11 +244,15 @@ func walkProjectTree(projName string, projDir string, activePaths PathsSet) (err
 }
 
 func makeProjectsListToProcess(dsn string, cliProjects []string) (projectsToProcess []p4db.NamePath, err error) {
-	db, err := p4db.Connect(dsn)
-	defer db.Close()
+	db, err := p4db.New(dsn)
 	if err != nil {
 		log.Fatal("Unable to connect to DB", err)
 	}
+
+	db.C.DB.SetConnMaxLifetime(0)
+	db.C.DB.SetMaxOpenConns(100)
+	db.C.DB.SetMaxIdleConns(10)
+
 	projects, err := db.ProjectsNamePath()
 	if err != nil {
 		log.Fatal("Failed to get projects list from DB", err)
