@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/op/go-logging"
 	"github.com/vaefremov/p4db"
 )
 
@@ -23,6 +23,13 @@ var (
 	dbRoot     = flag.String("db_root", "/opt/PANGmisc/DB_ROOT", "Massive data root catalogue")
 	szLimit    = flag.Int64("sz_limit", 10000, "Consider only files larger than this parameter (bytes)")
 	nProc      = flag.Int("n_proc", 5, "Number of processors")
+)
+
+var (
+	log               = logging.MustGetLogger("filescleanup")
+	format            = logging.MustStringFormatter(`%{time:02-01-2006 15:04:05} %{shortfunc} %{level:.3s} %{message}`)
+	backend1          = logging.NewLogBackend(os.Stderr, "", 0)
+	backend1Formatter = logging.NewBackendFormatter(backend1, format)
 )
 
 // PathsSet describes set of valid (sctual) paths relative to *dbRoot
@@ -63,12 +70,15 @@ func main() {
 	fmt.Println("Selected projects: ", selectedProjects)
 	fmt.Println("Number of processors:", *nProc)
 
+	logging.SetBackend(backend1Formatter)
+	logging.SetLevel(logging.DEBUG, "")
+
 	projectsToProcess, err := makeProjectsListToProcess(dsn, selectedProjects)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println(projectsToProcess, len(projectsToProcess), cap(projectsToProcess))
+	log.Info(projectsToProcess, len(projectsToProcess), cap(projectsToProcess))
 
 	storageItemsChan = make(chan StorageItem)
 	readyJobs = make(chan PathsSetPerProject)
@@ -101,31 +111,31 @@ func main() {
 	itemGeneratorsN.Wait()
 	close(storageItemsChan)
 	processorsN.Wait()
-	log.Println("Finished! Total Gbytes processed: ", float64(atomic.LoadInt64(&totalBytesProcessed))/1.e9)
+	log.Info("Finished! Total Gbytes processed: ", float64(atomic.LoadInt64(&totalBytesProcessed))/1.e9)
 }
 
 func storageItemsGenerator(i int) {
-	log.Println("**ItemsGenerator started", i)
+	log.Debug("**ItemsGenerator started", i)
 	for job := range readyJobs {
 		if _, err := os.Stat(job.ProjectPath); os.IsNotExist(err) {
-			log.Println("Warning:", err)
+			log.Warning("Warning:", err)
 			continue
 		}
 		walkProjectTree(job.ProjectName, job.ProjectPath, job.Paths)
 	}
-	log.Println("**ItemsGenerator finished", i)
+	log.Debug("**ItemsGenerator finished", i)
 	itemGeneratorsN.Done()
 }
 
 func finalProcessor(i int) {
-	log.Println("**FinalProcessor started", i)
+	log.Debug("**FinalProcessor started", i)
 	for item := range storageItemsChan {
 		if okToExpire(item.Path, item.Info) {
-			log.Println("==Processor", i, item)
+			log.Debug("==Processor", i, item)
 			atomic.AddInt64(&totalBytesProcessed, item.Info.Size())
 		}
 	}
-	log.Println("==FinalProcessor", i, "finished")
+	log.Debug("==FinalProcessor", i, "finished")
 	processorsN.Done()
 }
 
@@ -147,10 +157,10 @@ func databaseFeederForProjectStarter(dsn string, projInfo p4db.NamePath) {
 	sema <- struct{}{}
 	defer func() { <-sema }()
 	defer func() {
-		log.Println("**** Feeder ended")
+		log.Debug("**** Feeder ended")
 		nFeeders.Done()
 	}()
-	log.Println("**** Feeder started")
+	log.Debug("**** Feeder started")
 	if err := databaseFeederForProject(dsn, projInfo); err != nil {
 		log.Fatal("failed to create feeder for project ", projInfo.Name, err)
 	}
@@ -160,9 +170,9 @@ func databaseFeederForProject(dsn string, projInfo p4db.NamePath) (err error) {
 	db, err := p4db.New(dsn)
 	if err != nil {
 	}
-	log.Println("--Starting project", projInfo.Name)
+	log.Debug("--Starting project", projInfo.Name)
 	if paths, err := buildSetOfPaths4Project(db, projInfo); err == nil {
-		log.Println("--Sending job", paths.ProjectName, len(paths.Paths))
+		log.Debug("--Sending job", paths.ProjectName, len(paths.Paths))
 		readyJobs <- paths
 	} else {
 		log.Fatal(err)
