@@ -286,15 +286,15 @@ func makeProjectsListToProcess(dsn string, cliProjects []string) (projectsToProc
 func setupVerbosity() {
 	logging.SetBackend(backend1Formatter)
 	switch {
-	case *verbosity >= 8:
+	case *verbosity >= 10:
 		logging.SetLevel(logging.DEBUG, "")
-	case *verbosity >= 5:
+	case *verbosity >= 8:
 		logging.SetLevel(logging.INFO, "")
-	case *verbosity >= 4:
+	case *verbosity >= 6:
 		logging.SetLevel(logging.NOTICE, "")
-	case *verbosity >= 3:
+	case *verbosity >= 4:
 		logging.SetLevel(logging.WARNING, "")
-	case *verbosity >= 1:
+	case *verbosity >= 2:
 		logging.SetLevel(logging.ERROR, "")
 	case *verbosity == 0:
 		logging.SetLevel(logging.CRITICAL, "")
