@@ -57,21 +57,20 @@ var processorsN sync.WaitGroup
 var totalBytesProcessed int64
 
 func main() {
-	fmt.Println("Starting garbage collection...")
-	flag.Parse()
-	fmt.Println("Process older than:", *howOldDays)
-	fmt.Println("Unlink:", *unlink)
-	fmt.Println("Verbosity:", *verbosity)
-	fmt.Println("Host:", *host)
-	fmt.Println("DB_ROOT:", *dbRoot)
-	dsn := fmt.Sprintf("panadm:pan123@tcp(%s:3306)/PANGEA?allowOldPasswords=1&parseTime=true&charset=utf8", *host)
-	fmt.Println("DSN:", dsn)
-	selectedProjects := flag.Args()
-	fmt.Println("Selected projects: ", selectedProjects)
-	fmt.Println("Number of processors:", *nProc)
 
-	logging.SetBackend(backend1Formatter)
-	logging.SetLevel(logging.DEBUG, "")
+	flag.Parse()
+	setupVerbosity()
+
+	log.Info("Process older than:", *howOldDays, "days")
+	log.Info("Unlink:", *unlink)
+	log.Info("Verbosity:", *verbosity)
+	log.Info("Host:", *host)
+	log.Info("DB_ROOT:", *dbRoot)
+	dsn := fmt.Sprintf("panadm:pan123@tcp(%s:3306)/PANGEA?allowOldPasswords=1&parseTime=true&charset=utf8", *host)
+	log.Info("DSN:", dsn)
+	selectedProjects := flag.Args()
+	log.Info("Selected projects: ", selectedProjects)
+	log.Info("Number of processors:", *nProc)
 
 	projectsToProcess, err := makeProjectsListToProcess(dsn, selectedProjects)
 	if err != nil {
@@ -280,4 +279,27 @@ func makeProjectsListToProcess(dsn string, cliProjects []string) (projectsToProc
 		projectsToProcess = projects
 	}
 	return
+}
+
+// setupVerbosity selects logging backend and sets verbosity according to
+// values stored in *verbosity
+func setupVerbosity() {
+	logging.SetBackend(backend1Formatter)
+	switch {
+	case *verbosity >= 8:
+		logging.SetLevel(logging.DEBUG, "")
+	case *verbosity >= 5:
+		logging.SetLevel(logging.INFO, "")
+	case *verbosity >= 4:
+		logging.SetLevel(logging.NOTICE, "")
+	case *verbosity >= 3:
+		logging.SetLevel(logging.WARNING, "")
+	case *verbosity >= 1:
+		logging.SetLevel(logging.ERROR, "")
+	case *verbosity == 0:
+		logging.SetLevel(logging.CRITICAL, "")
+	default:
+		logging.SetLevel(logging.INFO, "")
+	}
+
 }
