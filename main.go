@@ -16,13 +16,13 @@ import (
 )
 
 var (
-	howOldDays = flag.Int("days", 7, "Process files older than (days)")
-	unlink     = flag.Bool("unlink", false, "Delete files")
-	verbosity  = flag.Int("verbosity", 0, "Verbosity level (from 0 to 10)")
-	host       = flag.String("host", "127.0.0.1", "Host to connect to")
-	dbRoot     = flag.String("db_root", "/opt/PANGmisc/DB_ROOT", "Massive data root catalogue")
-	szLimit    = flag.Int64("sz_limit", 500*1024, "Consider only files larger than this parameter (bytes)")
-	nProc      = flag.Int("n_proc", 5, "Number of processors")
+	howOldDays   = flag.Int("days", 7, "Process files older than (days)")
+	unlink       = flag.Bool("unlink", false, "Delete files")
+	verbosity    = flag.Int("verbosity", 0, "Verbosity level (from 0 to 10)")
+	host         = flag.String("host", "127.0.0.1", "Host to connect to")
+	dbRoot       = flag.String("db_root", "/opt/PANGmisc/DB_ROOT", "Massive data root catalogue")
+	szLimit      = flag.Int64("sz_limit", 500*1024, "Consider only files larger than this parameter (bytes)")
+	nProc        = flag.Int("n_proc", 5, "Number of processors")
 	excludeWells = flag.Bool("W", false, "Exclude well data from processing")
 )
 
@@ -55,8 +55,14 @@ var readyJobs chan PathsSetPerProject
 var itemGeneratorsN sync.WaitGroup
 var processorsN sync.WaitGroup
 
-var totalBytesProcessed int64
-var totalFilesProcessed int32
+type ReportInfo struct {
+	TotalBytesProcessed int64
+	TotalFilesProcessed int32
+}
+
+var totalInfo = ReportInfo{}
+
+var perProjectTotalInfo = make(map[string]*ReportInfo)
 
 func main() {
 
@@ -75,10 +81,14 @@ func main() {
 	log.Info("Number of processors:", *nProc)
 	log.Info("Exclude well data:", *excludeWells)
 
-
 	projectsToProcess, err := makeProjectsListToProcess(dsn, selectedProjects)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	// initialize report dictionary
+	for _, proj := range projectsToProcess {
+		perProjectTotalInfo[proj.Name] = &ReportInfo{}
 	}
 
 	log.Info(projectsToProcess, len(projectsToProcess), cap(projectsToProcess))
@@ -114,8 +124,14 @@ func main() {
 	itemGeneratorsN.Wait()
 	close(storageItemsChan)
 	processorsN.Wait()
-	log.Info("Finished! Total files processed: ", totalFilesProcessed)
-	log.Info("Finished! Total Gbytes processed: ", float64(atomic.LoadInt64(&totalBytesProcessed))/1.e9)
+
+	// Per-project report
+	if len(projectsToProcess) > 1 {
+		for proj, rep := range perProjectTotalInfo {
+			fmt.Printf("%-30s \t %.2fGb \t %d\n", proj, float64(rep.TotalBytesProcessed)/1.e9, rep.TotalFilesProcessed)
+		}
+	}
+	fmt.Printf("   Total:    %.2fGb \t %d\n", float64(atomic.LoadInt64(&totalInfo.TotalBytesProcessed))/1.e9, totalInfo.TotalFilesProcessed)
 }
 
 func storageItemsGenerator(i int) {
@@ -136,8 +152,12 @@ func finalProcessor(i int) {
 	for item := range storageItemsChan {
 		if okToExpire(item.Path, item.Info) {
 			log.Debug("==Processor", i, item.Path, item.Project, item.Info.Size())
-			atomic.AddInt64(&totalBytesProcessed, item.Info.Size())
-			atomic.AddInt32(&totalFilesProcessed, 1)
+			atomic.AddInt64(&totalInfo.TotalBytesProcessed, item.Info.Size())
+			atomic.AddInt32(&totalInfo.TotalFilesProcessed, 1)
+			
+			tmp := perProjectTotalInfo[item.Project]
+			atomic.AddInt64(&tmp.TotalBytesProcessed, item.Info.Size())
+			atomic.AddInt32(&tmp.TotalFilesProcessed, 1)
 		}
 	}
 	log.Debug("==FinalProcessor", i, "finished")
@@ -238,7 +258,7 @@ func buildSetOfPaths4Project(db *p4db.P4db, projInfo p4db.NamePath) (res PathsSe
 				}
 			}
 		}
-		log.Debug("Total number of referenced paths after including well data in project", projInfo.Name, len(pathsSet))	
+		log.Debug("Total number of referenced paths after including well data in project", projInfo.Name, len(pathsSet))
 	}
 	res = PathsSetPerProject{ProjectName: projInfo.Name, ProjectId: projInfo.Id, ProjectPath: projInfo.Path, Paths: pathsSet}
 	return
