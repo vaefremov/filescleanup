@@ -55,6 +55,7 @@ var itemGeneratorsN sync.WaitGroup
 var processorsN sync.WaitGroup
 
 var totalBytesProcessed int64
+var totalFilesProcessed int32
 
 func main() {
 
@@ -110,6 +111,7 @@ func main() {
 	itemGeneratorsN.Wait()
 	close(storageItemsChan)
 	processorsN.Wait()
+	log.Info("Finished! Total files processed: ", totalFilesProcessed)
 	log.Info("Finished! Total Gbytes processed: ", float64(atomic.LoadInt64(&totalBytesProcessed))/1.e9)
 }
 
@@ -130,8 +132,9 @@ func finalProcessor(i int) {
 	log.Debug("**FinalProcessor started", i)
 	for item := range storageItemsChan {
 		if okToExpire(item.Path, item.Info) {
-			log.Debug("==Processor", i, item)
+			log.Debug("==Processor", i, item.Path, item.Project, item.Info.Size())
 			atomic.AddInt64(&totalBytesProcessed, item.Info.Size())
+			atomic.AddInt32(&totalFilesProcessed, 1)
 		}
 	}
 	log.Debug("==FinalProcessor", i, "finished")
@@ -198,7 +201,7 @@ func buildSetOfPaths4Project(db *p4db.P4db, projInfo p4db.NamePath) (res PathsSe
 	and c.Status='Actual'
 	and cn2.Status='Actual'
 	and c.LinkContainer = cn2.CodeContainer 
-	and c.LinkMetaData in (select CodeData from MetaData where KeyWord like 'Path')`
+	and c.LinkMetaData in (select CodeData from MetaData where KeyWord in ('Path', 'DPath', 'PicturePath', 'auxDPath'))`
 	if rows, err := db.C.Query(sqlTmpl, projInfo.Id); err == nil {
 		var pPath string
 		for rows.Next() {
