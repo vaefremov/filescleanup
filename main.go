@@ -21,8 +21,9 @@ var (
 	verbosity  = flag.Int("verbosity", 0, "Verbosity level (from 0 to 10)")
 	host       = flag.String("host", "127.0.0.1", "Host to connect to")
 	dbRoot     = flag.String("db_root", "/opt/PANGmisc/DB_ROOT", "Massive data root catalogue")
-	szLimit    = flag.Int64("sz_limit", 10000, "Consider only files larger than this parameter (bytes)")
+	szLimit    = flag.Int64("sz_limit", 500*1024, "Consider only files larger than this parameter (bytes)")
 	nProc      = flag.Int("n_proc", 5, "Number of processors")
+	excludeWells = flag.Bool("W", false, "Exclude well data from processing")
 )
 
 var (
@@ -72,6 +73,8 @@ func main() {
 	selectedProjects := flag.Args()
 	log.Info("Selected projects: ", selectedProjects)
 	log.Info("Number of processors:", *nProc)
+	log.Info("Exclude well data:", *excludeWells)
+
 
 	projectsToProcess, err := makeProjectsListToProcess(dsn, selectedProjects)
 	if err != nil {
@@ -211,10 +214,32 @@ func buildSetOfPaths4Project(db *p4db.P4db, projInfo p4db.NamePath) (res PathsSe
 			} else {
 				return PathsSetPerProject{}, err
 			}
-
 		}
 	}
-
+	log.Debug("Total number of referenced paths for project ", projInfo.Name, len(pathsSet))
+	if *excludeWells {
+		sqlWellData := `select DataValue from DataValuesC as c,
+			Containers as cn2
+			where
+			cn2.TopParent = ?
+			and c.Status='Actual'
+			and cn2.ContainerType='weld'
+			and c.LinkContainer = cn2.CodeContainer 
+			and c.LinkMetaData in (select CodeData from MetaData where KeyWord in ('Path', 'DPath', 'PicturePath', 'auxDPath'))
+		`
+		if rows, err := db.C.Query(sqlWellData, projInfo.Id); err == nil {
+			var pPath string
+			for rows.Next() {
+				if err = rows.Scan(&pPath); err == nil {
+					pPath = path.Join(*dbRoot, "PROJECTS", pPath)
+					pathsSet[pPath] = true
+				} else {
+					return PathsSetPerProject{}, err
+				}
+			}
+		}
+		log.Debug("Total number of referenced paths after including well data in project", projInfo.Name, len(pathsSet))	
+	}
 	res = PathsSetPerProject{ProjectName: projInfo.Name, ProjectId: projInfo.Id, ProjectPath: projInfo.Path, Paths: pathsSet}
 	return
 }
