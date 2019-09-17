@@ -18,7 +18,7 @@ import (
 var (
 	howOldDays   = flag.Int("days", 7, "Process files older than (days)")
 	unlink       = flag.Bool("unlink", false, "Delete files")
-	verbosity    = flag.Int("verbosity", 0, "Verbosity level (from 0 to 10)")
+	verbosity    = flag.Int("verbosity", 2, "Verbosity level (from 0 to 10)")
 	host         = flag.String("host", "127.0.0.1", "Host to connect to")
 	dbRoot       = flag.String("db_root", "/opt/PANGmisc/DB_ROOT", "Massive data root catalogue")
 	szLimit      = flag.Int64("sz_limit", 500*1024, "Consider only files larger than this parameter (bytes)")
@@ -58,6 +58,8 @@ var processorsN sync.WaitGroup
 type ReportInfo struct {
 	TotalBytesProcessed int64
 	TotalFilesProcessed int32
+	TotalBytesFreed int64
+	TotalFilesUnlinked  int32
 }
 
 var totalInfo = ReportInfo{}
@@ -79,6 +81,7 @@ func main() {
 	selectedProjects := flag.Args()
 	log.Info("Selected projects: ", selectedProjects)
 	log.Info("Number of processors:", *nProc)
+	log.Info("Unlink files: ", *unlink)
 	log.Info("Exclude well data:", *excludeWells)
 
 	projectsToProcess, err := makeProjectsListToProcess(dsn, selectedProjects)
@@ -128,10 +131,10 @@ func main() {
 	// Per-project report
 	if len(projectsToProcess) > 1 {
 		for proj, rep := range perProjectTotalInfo {
-			fmt.Printf("%-30s \t %.2fGb \t %d\n", proj, float64(rep.TotalBytesProcessed)/1.e9, rep.TotalFilesProcessed)
+			fmt.Printf("%-30s \t %.2fGb \t %d \t %.2fGb \t %d\n", proj, float64(rep.TotalBytesProcessed)/1.e9, rep.TotalFilesProcessed, float64(rep.TotalBytesFreed)/1.e9, rep.TotalFilesUnlinked)
 		}
 	}
-	fmt.Printf("   Total:    %.2fGb \t %d\n", float64(atomic.LoadInt64(&totalInfo.TotalBytesProcessed))/1.e9, totalInfo.TotalFilesProcessed)
+	fmt.Printf("   Total:    %.2fGb \t %d \t %.2fGb \t %d\n", float64(totalInfo.TotalBytesProcessed)/1.e9, totalInfo.TotalFilesProcessed, float64(totalInfo.TotalBytesFreed)/1.e9, totalInfo.TotalFilesUnlinked)
 }
 
 func storageItemsGenerator(i int) {
@@ -152,9 +155,22 @@ func finalProcessor(i int) {
 	for item := range storageItemsChan {
 		if okToExpire(item.Path, item.Info) {
 			log.Debug("==Processor", i, item.Path, item.Project, item.Info.Size())
+			if *unlink {
+				if err := os.Remove(item.Path); err == nil {
+					atomic.AddInt64(&totalInfo.TotalBytesFreed, item.Info.Size())
+					atomic.AddInt32(&totalInfo.TotalFilesUnlinked, 1)
+		
+					tmp := perProjectTotalInfo[item.Project]
+					atomic.AddInt64(&tmp.TotalBytesFreed, item.Info.Size())
+					atomic.AddInt32(&tmp.TotalFilesUnlinked, 1)	
+					log.Info("Unlinked:", item.Path)						
+				} else {
+					log.Error(err)
+				}
+			}
 			atomic.AddInt64(&totalInfo.TotalBytesProcessed, item.Info.Size())
 			atomic.AddInt32(&totalInfo.TotalFilesProcessed, 1)
-			
+
 			tmp := perProjectTotalInfo[item.Project]
 			atomic.AddInt64(&tmp.TotalBytesProcessed, item.Info.Size())
 			atomic.AddInt32(&tmp.TotalFilesProcessed, 1)
